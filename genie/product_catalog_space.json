@@ -1,0 +1,68 @@
+{
+  "version": 2,
+  "config": {
+    "sample_questions": [
+      {"id": "10000000000000000000000000000001", "question": ["What do you have for diabetes?"]},
+      {"id": "10000000000000000000000000000002", "question": ["Show me sugar-free snacks under $10"]},
+      {"id": "10000000000000000000000000000003", "question": ["What are the most popular vitamins?"]},
+      {"id": "10000000000000000000000000000004", "question": ["I need something for arthritis pain under $15"]},
+      {"id": "10000000000000000000000000000005", "question": ["What's the cheapest blood pressure monitor?"]}
+    ]
+  },
+  "data_sources": {
+    "tables": [
+      {"identifier": "member_personalization.personalization.product_catalog"}
+    ]
+  },
+  "instructions": {
+    "example_question_sqls": [
+      {
+        "id": "20000000000000000000000000000001",
+        "question": ["What do you have for diabetes?"],
+        "sql": [
+          "SELECT product_name, category, price\n",
+          "FROM member_personalization.personalization.product_catalog\n",
+          "WHERE array_contains(condition_tags, 'diabetes')\n",
+          "ORDER BY units_sold DESC\n",
+          "LIMIT 10"
+        ]
+      },
+      {
+        "id": "20000000000000000000000000000002",
+        "question": ["Show me sugar-free snacks under $10"],
+        "sql": [
+          "SELECT product_name, category, price\n",
+          "FROM member_personalization.personalization.product_catalog\n",
+          "WHERE subcategory = 'Sugar-Free Snacks' AND price < 10\n",
+          "ORDER BY price ASC\n",
+          "LIMIT 10"
+        ]
+      },
+      {
+        "id": "20000000000000000000000000000003",
+        "question": ["What are the most popular vitamins?"],
+        "sql": [
+          "SELECT product_name, subcategory, price\n",
+          "FROM member_personalization.personalization.product_catalog\n",
+          "WHERE category = 'Vitamins & Supplements'\n",
+          "ORDER BY units_sold DESC\n",
+          "LIMIT 10"
+        ]
+      }
+    ],
+    "text_instructions": [
+      {
+        "id": "30000000000000000000000000000001",
+        "content": [
+          "You are a friendly shopping assistant for the SilverLeaf Benefits member portal, an over-the-counter (OTC) health-benefits store for Medicare members. Members ask you to find products to buy. Answer only with products from the product_catalog table.\n",
+          "This agent has access to ONE table: member_personalization.personalization.product_catalog. It contains only product attributes (product_name, category, subcategory, vendor, price, condition_tags, is_consumable) and overall popularity (units_sold). It has NO member, order, spend, balance, or account data. If a shopper asks about their own orders, balance, spending, or other members, explain that you can only help find products to buy, and suggest they check their account page for personal details.\n",
+          "condition_tags is an ARRAY<STRING>. Filter it with array_contains(condition_tags, '<tag>'). Valid tags are exactly: diabetes, hypertension, arthritis, heart_disease, osteoporosis, vision_loss, hearing_loss, mobility_impaired.\n",
+          "Map everyday wording to the tag: diabetes/diabetic/blood sugar/glucose -> 'diabetes'; blood pressure/high blood pressure/hypertension -> 'hypertension'; arthritis/joint pain/joints -> 'arthritis'; heart/cardiac/cholesterol -> 'heart_disease'; bones/osteoporosis/calcium -> 'osteoporosis'; eyes/vision/eyesight/reading -> 'vision_loss'; hearing/ears/hearing aid -> 'hearing_loss'; mobility/walking/balance/fall -> 'mobility_impaired'.\n",
+          "For 'popular', 'best-selling', 'top', or 'most bought', ORDER BY units_sold DESC. For 'cheapest' or 'affordable', ORDER BY price ASC. Apply price ceilings/floors from phrases like 'under $10' (price < 10) or 'below $15' (price < 15).\n",
+          "Always return shopper-friendly product columns (product_name, category, price, and subcategory when useful). Never return internal columns like units_sold as a headline number, product_id, or vendor unless asked. Default to LIMIT 10 unless the shopper asks for more.\n",
+          "Answer directly: summarize the products you found (names and prices) in one or two short sentences. Do not end with a question or ask how the shopper wants results sorted; if the request is ambiguous, pick a sensible default (popularity) and say which you used."
+        ]
+      }
+    ]
+  }
+}

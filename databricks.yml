@@ -1,0 +1,313 @@
+# =============================================================================
+# SilverLeaf Benefits Member Personalization — Home-Page Recommendations
+# =============================================================================
+# An all-Databricks, batch recommendation engine. The pipeline (optionally)
+# generates synthetic raw data, ingests it with Lakeflow (bronze -> silver), builds
+# feature tables, scores + evaluates recommendations, writes a GenAI welcome banner,
+# reverse-ETLs the results into Lakebase Autoscaling, applies Unity Catalog governance,
+# and publishes a Genie Agent. A Databricks App renders the personalized home page.
+#
+# ---------------------------------------------------------------------------
+# CONFIGURE FIRST (for your workspace) — set these before deploying:
+#   • workspace_host     your Databricks workspace URL (variable, used by targets)
+#   • catalog / schema   where tables are written
+#   • lakebase_endpoint  your Lakebase Autoscaling endpoint
+#   • lakebase_branch    your Lakebase branch
+#   • app_name           a globally-unique Databricks App name
+#   • app/app.yaml       LAKEBASE_ENDPOINT (the app reads this at runtime)
+#
+# Set them by editing the `variables` defaults below, passing --var "key=value",
+# or putting your values in a git-ignored `databricks.local.yml` (recommended —
+# keeps workspace-specifics out of the repo). See README → "Deploy to your
+# workspace" for the full first-run bootstrap.
+#
+# Deploy:  databricks bundle deploy -t dev
+# Run:     databricks bundle run personalization_pipeline -t dev
+# =============================================================================
+bundle:
+  name: silverleaf-personalization-demo
+
+# Optional local overrides (git-ignored) so workspace-specific values aren't committed.
+include:
+  - "*.local.yml"
+
+variables:
+  catalog:
+    description: Unity Catalog catalog where demo tables are written.
+    default: main
+  schema:
+    description: Schema where demo tables are written.
+    default: personalization
+
+  generate_synthetic_data:
+    description: >-
+      "true" generates synthetic gold-layer data (demo mode). "false" skips
+      generation and uses your own gold tables (set the src_* variables).
+    default: "true"
+
+  # --- Bring-your-own-data: point these at YOUR gold tables (leave blank to
+  #     use the synthetic tables created in {catalog}.{schema}). ---
+  src_members:
+    description: FQN of your members table (blank = {catalog}.{schema}.members).
+    default: ""
+  src_products:
+    description: FQN of your products/catalog table (blank = {catalog}.{schema}.products).
+    default: ""
+  src_orders:
+    description: FQN of your orders table (blank = {catalog}.{schema}.orders).
+    default: ""
+  src_order_items:
+    description: FQN of your order line-items table (blank = {catalog}.{schema}.order_items).
+    default: ""
+  src_sessions:
+    description: FQN of your web-sessions table (blank = {catalog}.{schema}.web_sessions).
+    default: ""
+  ref_date:
+    description: As-of date (YYYY-MM-DD) for recency/tenure math. Blank = today's date.
+    default: ""
+
+  run_as_sp:
+    description: Service principal application ID to run the prod job as (prod target only).
+    default: ""
+  notification_email:
+    description: Email for job-failure alerts (used by the commented example in the job).
+    default: ""
+
+  # --- Refresh cadence (how often features + recommendations are recomputed) ---
+  schedule_cron:
+    description: >-
+      Quartz cron for the batch refresh. Default is daily at 6am. Examples:
+      every 3 hours "0 0 0/3 * * ?"; hourly "0 0 * * * ?"; weekly Mon 6am "0 0 6 ? * MON".
+    default: "0 0 6 * * ?"
+  schedule_timezone:
+    description: Timezone for the schedule.
+    default: "America/New_York"
+  schedule_pause:
+    description: PAUSED or UNPAUSED. Dev keeps it PAUSED; set UNPAUSED for prod.
+    default: "PAUSED"
+
+  # --- "Recommended for You" engine ---
+  cf_method:
+    description: >-
+      Engine for "Recommended for You": "hybrid" (default — co-occurrence + condition
+      boost, the 03b offline-evaluation champion), "cooccurrence" (CF only), or "als"
+      (Spark MLlib matrix factorization — a trained model). ALS trains on
+      serverless but the fitted model can exceed serverless's 256MB Spark Connect ML
+      model-size guard; run cf_method=als on a CLASSIC cluster for reliability.
+    default: "hybrid"
+
+  # --- App ---
+  app_name:
+    description: >-
+      Databricks App name (must be globally unique in the workspace, <=30 chars).
+      App names are NOT auto-prefixed per user, so override this in a shared
+      workspace (e.g. add your initials) to avoid collisions.
+    default: "silverleaf-home"
+  app_sp_role:
+    description: >-
+      Optional: the Databricks App service principal's application ID.
+      Leave blank to auto-discover from app_name. Set only to override.
+    default: ""
+
+  # --- Evaluation + GenAI + governance (notebooks 03b, 03c, 05) ---
+  holdout_days:
+    description: Temporal-holdout window (days) for the offline recommendation evaluation (03b).
+    default: "60"
+  llm_endpoint:
+    description: Foundation Model endpoint ai_query() uses for the member welcome banner (03c).
+    default: "databricks-claude-sonnet-4-6"
+  warehouse_id:
+    description: SQL warehouse the Genie Agent runs on (blank = first warehouse in the workspace).
+    default: ""
+  care_team_group:
+    description: Account group allowed to see unmasked member health conditions (05).
+    default: "silverleaf-care-team"
+  mlflow_experiment:
+    description: MLflow experiment that collects scoring, evaluation, and GenAI runs.
+    default: "/Shared/silverleaf-personalization"
+
+  # --- Lakebase serving (notebook 04) ---
+  lakebase_endpoint:
+    description: Lakebase Autoscaling read-write endpoint path (projects/.../endpoints/primary).
+    default: ""
+  lakebase_branch:
+    description: Lakebase branch path (projects/.../branches/production).
+    default: ""
+
+targets:
+  # Development: deploys under your user, prefixes resource names, pauses schedules.
+  dev:
+    mode: development
+    default: true
+    workspace:
+      # CONFIGURE: your workspace URL (or set it in databricks.local.yml).
+      host: https://YOUR-WORKSPACE.cloud.databricks.com
+
+  # Production: deploy to a shared path and (recommended) run as a service principal.
+  # Configure the host and run_as_sp, then: databricks bundle deploy -t prod
+  prod:
+    mode: production
+    variables:
+      # distinct app name so prod doesn't collide with the dev app
+      app_name: silverleaf-home-prod
+    workspace:
+      host: https://YOUR-WORKSPACE.cloud.databricks.com
+      root_path: /Workspace/Shared/.bundle/${bundle.name}/${bundle.target}
+    # run_as:
+    #   service_principal_name: ${var.run_as_sp}
+
+resources:
+  # Lakeflow Spark Declarative Pipeline: raw JSON (Volume) -> bronze -> silver.
+  # Auto Loader ingests each landed feed; silver publishes the cleaned, typed,
+  # quality-checked tables under {catalog}.{schema}. Serverless by default.
+  pipelines:
+    ingest:
+      name: "[SilverLeaf Demo] Raw -> Bronze -> Silver Ingest"
+      catalog: ${var.catalog}
+      schema: ${var.schema}
+      serverless: true
+      photon: true
+      configuration:
+        # Where notebook 01 lands the raw JSON feeds; referenced as ${raw_volume_path}
+        # inside the pipeline SQL.
+        raw_volume_path: /Volumes/${var.catalog}/${var.schema}/raw
+      libraries:
+        - file:
+            path: ./src/ingest_pipeline/bronze.sql
+        - file:
+            path: ./src/ingest_pipeline/silver.sql
+
+  jobs:
+    personalization_pipeline:
+      name: "[SilverLeaf Demo] Member Personalization Pipeline"
+      tags:
+        demo: silverleaf-personalization
+      # Recommended for prod: alert on failure. Set var.notification_email and uncomment.
+      # email_notifications:
+      #   on_failure:
+      #     - ${var.notification_email}
+      tasks:
+        # 1. Land synthetic raw data as JSON files in the UC Volume {catalog}.{schema}.raw.
+        #    SKIPS itself when generate_synthetic_data="false" (bring-your-own-data).
+        - task_key: generate_data
+          notebook_task:
+            notebook_path: ./src/01_generate_data.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              generate_synthetic_data: ${var.generate_synthetic_data}
+        # 2. Lakeflow ingest — Auto Loader reads the raw JSON and builds bronze -> silver.
+        #    Publishes the silver tables (members, products, orders, order_items,
+        #    web_sessions) that feature engineering consumes. Bring-your-own-data
+        #    customers who already have gold tables can remove this task and point the
+        #    src_* variables at their own tables instead (see notebook 02).
+        #    full_refresh: notebook 01 rewrites the raw files every run, so bronze/silver
+        #    are rebuilt from them rather than Auto Loader appending them as new files.
+        - task_key: ingest_raw
+          depends_on:
+            - task_key: generate_data
+          pipeline_task:
+            pipeline_id: ${resources.pipelines.ingest.id}
+            full_refresh: true
+        # 3. Feature engineering — reads the silver tables (yours or synthetic).
+        - task_key: feature_engineering
+          depends_on:
+            - task_key: ingest_raw
+          notebook_task:
+            notebook_path: ./src/02_feature_engineering.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              src_members: ${var.src_members}
+              src_products: ${var.src_products}
+              src_orders: ${var.src_orders}
+              src_order_items: ${var.src_order_items}
+              src_sessions: ${var.src_sessions}
+              ref_date: ${var.ref_date}
+        # 4. Build recommendations (items + categories).
+        - task_key: train_and_score
+          depends_on:
+            - task_key: feature_engineering
+          notebook_task:
+            notebook_path: ./src/03_train_and_score.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              src_members: ${var.src_members}
+              src_products: ${var.src_products}
+              src_order_items: ${var.src_order_items}
+              cf_method: ${var.cf_method}
+              mlflow_experiment: ${var.mlflow_experiment}
+          # cf_method="hybrid"/"cooccurrence" run on serverless. For cf_method="als", attach a classic
+          # job cluster here (Databricks ML runtime) — the fitted model can exceed serverless's
+          # 256MB Spark Connect ML model-size guard. Example:
+          #   new_cluster:
+          #     spark_version: 15.4.x-cpu-ml-scala2.12
+          #     node_type_id: <your-node-type>
+          #     num_workers: 2
+        # 4b. Offline evaluation — temporal holdout; every recommender vs the best-seller
+        #     baseline (HitRate/Precision/Recall/NDCG@10), logged to MLflow + a UC table.
+        - task_key: evaluate_recommendations
+          depends_on:
+            - task_key: train_and_score
+          notebook_task:
+            notebook_path: ./src/03b_evaluate_recommendations.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              holdout_days: ${var.holdout_days}
+              mlflow_experiment: ${var.mlflow_experiment}
+        # 4c. GenAI — ai_query() writes a guard-railed welcome banner per member.
+        - task_key: genai_member_messages
+          depends_on:
+            - task_key: train_and_score
+          notebook_task:
+            notebook_path: ./src/03c_genai_member_messages.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              llm_endpoint: ${var.llm_endpoint}
+              mlflow_experiment: ${var.mlflow_experiment}
+        # 5. Serve via Lakebase Autoscaling — managed synced tables (reverse ETL).
+        #    Auto-discovers the app's service principal from app_name and grants it
+        #    SELECT on the synced tables. Requires lakebase_endpoint/lakebase_branch set
+        #    (see databricks.local.yml) and the Lakebase project to exist.
+        - task_key: sync_to_lakebase
+          depends_on:
+            - task_key: genai_member_messages
+          notebook_task:
+            notebook_path: ./src/04_sync_to_lakebase.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              endpoint: ${var.lakebase_endpoint}
+              branch: ${var.lakebase_branch}
+              app_name: ${var.app_name}
+              app_sp_role: ${var.app_sp_role}
+        # 6. Governance + Genie — tags, column mask, de-identified analyst view, the
+        #    product_catalog view, least-privilege grants for the app SP, and the
+        #    shopper-facing Genie Agent (created/updated from genie/*.json).
+        - task_key: governance_and_genie
+          depends_on:
+            - task_key: genai_member_messages
+            - task_key: evaluate_recommendations
+          notebook_task:
+            notebook_path: ./src/05_governance_and_genie.py
+            base_parameters:
+              catalog: ${var.catalog}
+              schema: ${var.schema}
+              app_name: ${var.app_name}
+              warehouse_id: ${var.warehouse_id}
+              care_team_group: ${var.care_team_group}
+      schedule:
+        # Batch cadence — nothing is real-time. Tune via the schedule_* variables
+        # (e.g. --var "schedule_cron=0 0 0/3 * * ?" for every 3 hours).
+        quartz_cron_expression: ${var.schedule_cron}
+        timezone_id: ${var.schedule_timezone}
+        pause_status: ${var.schedule_pause}
+
+  apps:
+    home_page:
+      name: ${var.app_name}
+      description: "SilverLeaf Benefits personalized member home page (demo, served from Lakebase Autoscaling)"
+      source_code_path: ./app

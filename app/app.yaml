@@ -1,0 +1,12 @@
+command: ["streamlit", "run", "app.py"]
+env:
+  # CONFIGURE: set to your Lakebase Autoscaling endpoint before deploying the app.
+  - name: LAKEBASE_ENDPOINT
+    value: projects/member-personalization/branches/production/endpoints/primary
+  # Postgres schema the synced tables land in (matches the UC schema).
+  - name: LAKEBASE_SCHEMA
+    value: personalization
+  # Catalog-scoped Genie Agent powering "Ask SilverLeaf". Blank = look it up by title
+  # ("SilverLeaf Product Finder", created by notebook 05).
+  - name: GENIE_SPACE_ID
+    value: ""
